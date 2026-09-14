@@ -2,14 +2,15 @@ import type * as vscode from 'vscode'
 import { window, workspace } from 'vscode'
 import * as fs from 'fs'
 import * as path from 'path'
-import { type JsonFragment } from '@ethersproject/abi'
+import { parseUnits } from 'viem'
 
 import {
   type CompiledJSONOutput,
   type ConstructorInputValue,
   getAbi,
   type IFunctionQP,
-  type EstimateGas
+  type EstimateGas,
+  type Fees
 } from '../types'
 import { logger } from '../lib'
 import { errors } from '../config'
@@ -19,8 +20,18 @@ import {
   writeFunction
 } from '../lib/file'
 import { getSelectedNetConf } from './networks'
-
+import { get1559Fees } from './get1559Fees'
+import { getSelectedProvider } from './utils'
 import axios from 'axios'
+
+// Define a minimal ABI item type for compatibility
+export type AbiItem = {
+  type: string
+  name?: string
+  stateMutability?: string
+  inputs?: any[]
+  outputs?: any[]
+}
 
 const createDeployed: any = (contract: CompiledJSONOutput) => {
   const fullPath = getDeployedFullPath(contract)
@@ -67,18 +78,38 @@ const createFunctionInput: any = (contract: CompiledJSONOutput) => {
   }
 
   const functionsAbi = getAbi(contract)?.filter(
-    (i: JsonFragment) => i.type === 'function'
+    (i: AbiItem) => i.type === 'function'
   )
   if (functionsAbi === undefined || functionsAbi.length === 0) {
     logger.error("This contract doesn't have any function")
     return
   }
 
-  const functions = functionsAbi.map((e: { name: any, stateMutability: any, inputs: any[] }) => ({
+  const functions = functionsAbi.map((e: any) => ({
     name: e.name,
     stateMutability: e.stateMutability,
-    inputs: e.inputs?.map((c) => ({ ...c, value: '' }))
+    ...(e.stateMutability === 'payable'
+      ? {
+          inputs: [
+            ...e.inputs?.map((c: any) => ({
+              ...c,
+              value: ''
+            })),
+            {
+              value: 0,
+              type: 'payable',
+              unit: 'gwei'
+            }]
+        }
+      : {
+          inputs: [
+            ...e.inputs?.map((c: any) => ({
+              ...c,
+              value: ''
+            }))]
+        })
   }))
+  console.log(functions)
 
   writeFunction(getFunctionInputFullPath(contract), contract, functions)
 }
@@ -100,11 +131,15 @@ const getFunctionInputFullPath: any = (contract: CompiledJSONOutput) => {
 }
 
 const getConstructorInputFullPath: any = (contract: CompiledJSONOutput) => {
-  if (contract.path === undefined) {
-    throw new Error('Contract Path is empty.')
+  if (workspace.workspaceFolders === undefined) return ''
+  const constructorDir = path.join(workspace.workspaceFolders[0].uri.fsPath, 'constructor')
+  
+  // Ensure constructor directory exists
+  if (!fs.existsSync(constructorDir)) {
+    fs.mkdirSync(constructorDir, { recursive: true })
   }
-
-  return path.join(contract.path, `${contract.name as string}_constructor_input.json`)
+  
+  return path.join(constructorDir, `${contract.name as string}.json`)
 }
 
 const getDeployedInputs: any = (context: vscode.ExtensionContext) => {
@@ -126,23 +161,30 @@ const getConstructorInputs: any = (context: vscode.ExtensionContext) => {
       'contract'
     ) as CompiledJSONOutput
     const fullPath = getConstructorInputFullPath(contract)
+    
+    // Check if file exists
+    if (!fs.existsSync(fullPath)) {
+      logger.log(`Constructor input file not found: ${fullPath}`)
+      return undefined
+    }
+    
     const inputs = fs.readFileSync(fullPath).toString()
-
     const constructorInputs: ConstructorInputValue[] = JSON.parse(inputs)
     return constructorInputs.map((e) => e.value) // flattened parameters of input
   } catch (e) {
-    return []
+    logger.error(`Error reading constructor inputs: ${e}`)
+    return undefined
   }
 }
 
-const getFunctionParmas: any = (func: JsonFragment) => {
+const getFunctionParmas: any = (func: AbiItem) => {
   const inputs = func.inputs?.map((e) => e.type)
   return inputs?.join(', ')
 }
 
 const getFunctionInputs: any = async (
   context: vscode.ExtensionContext
-): Promise<JsonFragment> => {
+): Promise<AbiItem> => {
   return await new Promise((resolve, reject) => {
     try {
       const contract = context.workspaceState.get(
@@ -151,7 +193,7 @@ const getFunctionInputs: any = async (
       const fullPath = getFunctionInputFullPath(contract)
       const inputs = fs.readFileSync(fullPath).toString()
 
-      const functions: JsonFragment[] = JSON.parse(inputs)
+      const functions: AbiItem[] = JSON.parse(inputs)
 
       const quickPick = window.createQuickPick<IFunctionQP>()
       quickPick.items = functions.map((f) => ({
@@ -159,12 +201,13 @@ const getFunctionInputs: any = async (
         functionKey: f.name
       })) as IFunctionQP[]
       quickPick.placeholder = 'Select function'
-      quickPick.onDidChangeSelection((selection: IFunctionQP[]) => {
-        if ((selection[0] != null) && (workspace.workspaceFolders != null)) {
-          const { functionKey } = selection[0]
+      quickPick.onDidChangeSelection(() => {
+        const selection = quickPick.selectedItems[0]
+        if ((selection != null) && (workspace.workspaceFolders != null)) {
+          const { functionKey } = selection
           quickPick.dispose()
           const abiItem = functions.filter(
-            (i: JsonFragment) => i.name === functionKey
+            (i: AbiItem) => i.name === functionKey
           )
           if (abiItem.length === 0) throw new Error('No function is selected')
           resolve(abiItem[0])
@@ -205,7 +248,7 @@ const createConstructorInput: any = (contract: CompiledJSONOutput) => {
   }
 
   const constructor = getAbi(contract)?.filter(
-    (i: JsonFragment) => i.type === 'constructor'
+    (i: AbiItem) => i.type === 'constructor'
   )
   if (constructor === undefined) {
     logger.log("Abi doesn't exist on the loaded contract")
@@ -229,7 +272,8 @@ const createConstructorInput: any = (contract: CompiledJSONOutput) => {
     }
   )
 
-  writeConstructor(getConstructorInputFullPath(contract), contract, inputs)
+  const fullPath = getConstructorInputFullPath(contract)
+  writeConstructor(fullPath, contract, inputs)
 }
 
 const getNetworkBlockpriceUrl: any = (context: vscode.ExtensionContext) => {
@@ -239,53 +283,89 @@ const getNetworkBlockpriceUrl: any = (context: vscode.ExtensionContext) => {
   } else { /* empty */ }
 }
 
+export const getNetworkFeeData = async (context: vscode.ExtensionContext): Promise<Fees> => {
+  const chainID = getSelectedNetConf(context).chainID
+  const gasCondition = (await context.workspaceState.get(
+    'gas'
+  )) as string
+  if (chainID === '137' || chainID === '1') {
+    const feeData = await getGasEstimates(gasCondition, context)
+    return {
+      maxFeePerGas: parseUnits(feeData.maxFeePerGas.toString(), 9),
+      maxPriorityFeePerGas: parseUnits(feeData.maxPriorityFeePerGas.toString(), 9)
+    }
+  } else {
+    const client = getSelectedProvider(context)
+    // Use viem's fee data method or custom RPC call
+    const feeHistory = await client.request({
+      method: 'eth_feeHistory',
+      params: ['0x5', 'latest', [70]]
+    })
+    // Simplified: you may want to use get1559Fees here
+    const baseFeePerGas = feeHistory.baseFeePerGas
+    const reward = feeHistory.reward
+    const maxPriorityFeePerGas = reward.reduce((accumulator: bigint, currentValue: string[]) => accumulator + BigInt(currentValue[0]), 0n) / BigInt(reward.length)
+    const maxFeePerGas = BigInt(baseFeePerGas[baseFeePerGas.length - 1]) * 2n + maxPriorityFeePerGas
+    return {
+      maxFeePerGas,
+      maxPriorityFeePerGas
+    }
+  }
+}
+
 const getGasEstimates: any = async (
   condition: string,
   context: vscode.ExtensionContext
 ) => {
   let estimate: EstimateGas | undefined
-  const blockPriceUri = getNetworkBlockpriceUrl(context)
-  if (blockPriceUri !== undefined) {
-    await axios
-      .get(blockPriceUri, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers':
-            'Origin, X-Requested-With, Content-Type, Accept'
-        }
-      })
-      .then((res: any) => {
-        if (res.status === 200) {
-          switch (condition) {
-            case 'Low': {
-              estimate = res.data.blockPrices[0].estimatedPrices.find(
-                (x: any) => x.confidence === 70
-              ) as EstimateGas
-              break
-            }
-            case 'Medium': {
-              estimate = res.data.blockPrices[0].estimatedPrices.find(
-                (x: any) => x.confidence === 90
-              ) as EstimateGas
-              break
-            }
-            case 'High': {
-              estimate = res.data.blockPrices[0].estimatedPrices.find(
-                (x: any) => x.confidence === 99
-              ) as EstimateGas
-              break
-            }
+  const chainID = getSelectedNetConf(context).chainID
+  // try to use `eth_feeHistory` RPC API
+  const client = getSelectedProvider(context)
+  if (chainID === '59140') {
+    const maxFeePerGas = await get1559Fees(client, BigInt(10), 70)
+    console.log(maxFeePerGas)
+    return maxFeePerGas
+  } else {
+    const blockPriceUri = getNetworkBlockpriceUrl(context)
+    if (blockPriceUri !== undefined) {
+      return await axios
+        .get(blockPriceUri, {
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers':
+              'Origin, X-Requested-With, Content-Type, Accept'
           }
-
-          return estimate
-        }
-      })
-      .catch((error: any) => {
-        console.error(error)
-      })
+        })
+        .then((res: any) => {
+          if (res.status === 200) {
+            switch (condition) {
+              case 'Low': {
+                estimate = res.data.blockPrices[0].estimatedPrices.find(
+                  (x: any) => x.confidence === 70
+                ) as EstimateGas
+                break
+              }
+              case 'Medium': {
+                estimate = res.data.blockPrices[0].estimatedPrices.find(
+                  (x: any) => x.confidence === 90
+                ) as EstimateGas
+                break
+              }
+              case 'High': {
+                estimate = res.data.blockPrices[0].estimatedPrices.find(
+                  (x: any) => x.confidence === 99
+                ) as EstimateGas
+                break
+              }
+            }
+            return estimate
+          }
+        })
+        .catch((error: any) => {
+          console.error(error)
+        })
+    }
   }
-
-  return estimate
 }
 
 const fetchERC4907Contracts: any = async (uri: string) => {
@@ -312,14 +392,13 @@ const isHardhatProject = (path_: string): boolean => {
 }
 
 // Checks is foundry project
-const isFoundryProject = (path_: string): boolean => {
-  return (
-    fs
-      .readdirSync(path_)
-      .filter(
-        (file) => file === 'foundry.toml'
-      ).length > 0
-  )
+const isFoundryProject = async (): Promise<boolean> => {
+  const foundryConfigFile = await workspace.findFiles('**/foundry.toml', '**/{node_modules,lib}/**')
+  if (foundryConfigFile.length > 0) {
+    return true
+  } else {
+    return false
+  }
 }
 
 export {

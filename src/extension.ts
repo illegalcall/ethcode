@@ -4,7 +4,8 @@ import {
   deployContract,
   displayBalance,
   setTransactionGas,
-  updateSelectedNetwork
+  updateSelectedNetwork,
+  getNetworkGasPrices
 } from './utils/networks'
 import { logger } from './lib'
 import {
@@ -24,10 +25,10 @@ import { provider, status, wallet, contract } from './api'
 import { events } from './api/events'
 import { event } from './api/api'
 import { type API } from './types'
-// import path = require('path')
 
 export async function activate (context: ExtensionContext): Promise<API | undefined> {
-  context.subscriptions.push(
+  const disposables = [
+
     // Create new account with password
     commands.registerCommand('ethcode.account.create', async () => {
       try {
@@ -78,6 +79,7 @@ export async function activate (context: ExtensionContext): Promise<API | undefi
           logger.error(error)
         })
     }),
+
     // Select Ethereum Account
     commands.registerCommand('ethcode.account.select', () => {
       selectAccount(context)
@@ -102,6 +104,11 @@ export async function activate (context: ExtensionContext): Promise<API | undefi
         })
     }),
 
+    // Get network gas prices
+    commands.registerCommand('ethcode.transaction.gas.prices', async () => {
+      await getNetworkGasPrices(context)
+    }),
+
     // Load combined JSON output
     commands.registerCommand('ethcode.compiled-json.load', () => {
       const editorContent = (window.activeTextEditor != null)
@@ -112,7 +119,7 @@ export async function activate (context: ExtensionContext): Promise<API | undefi
 
     // Load all combined JSON output
     commands.registerCommand('ethcode.compiled-json.load.all', async () => {
-      parseBatchCompiledJSON(context)
+      await parseBatchCompiledJSON(context)
     }),
 
     // Select a compiled json from the list
@@ -135,6 +142,7 @@ export async function activate (context: ExtensionContext): Promise<API | undefi
           logger.error(error)
         })
     }),
+
     // Import Key pair
     commands.registerCommand('ethcode.account.import', async () => {
       importKeyPair(context)
@@ -147,7 +155,9 @@ export async function activate (context: ExtensionContext): Promise<API | undefi
     commands.registerCommand('ethcode.activate', async () => {
       logger.success('Welcome to Ethcode!')
     })
-  )
+  ]
+
+  context.subscriptions.push(...disposables)
 
   // API for extensions
   // ref: https://code.visualstudio.com/api/references/vscode-api#extensions
@@ -220,12 +230,12 @@ export async function activate (context: ExtensionContext): Promise<API | undefi
     events: events()
   }
 
-  api.events.accountCreated.event((info) => {
+  context.subscriptions.push(api.events.accountCreated.event((info) => {
     if (info.success) logger.success(info.successMsg)
     else {
       logger.error(info.error)
     }
-  })
+  }))
 
   const path_ = workspace.workspaceFolders
   if (path_ === undefined) {
@@ -237,14 +247,14 @@ export async function activate (context: ExtensionContext): Promise<API | undefi
   )
 
   watcher.onDidCreate(async (uri) => {
-    parseBatchCompiledJSON(context)
+    await parseBatchCompiledJSON(context)
     const contracts = context.workspaceState.get('contracts') as string[]
     if (contracts === undefined || contracts.length === 0) return []
     event.contracts.fire(Object.keys(contracts))
   })
 
   watcher.onDidChange(async (uri) => {
-    parseBatchCompiledJSON(context)
+    await parseBatchCompiledJSON(context)
     const contracts = context.workspaceState.get('contracts') as string[]
     if (contracts === undefined || contracts.length === 0) return []
     event.contracts.fire(Object.keys(contracts))
